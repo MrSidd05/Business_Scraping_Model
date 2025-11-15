@@ -76,7 +76,7 @@ def save_timestamped_dup(rows):
     path = os.path.join(DUP_DIR, f"duplicated_{timestamp}.xlsx")
     wb = Workbook()
     ws = wb.active
-    ws.append(["date", "shop_name", "phone_number", "area_location"])
+    ws.append(["date", "shop_name", "phone_number", "area_location", "google_maps_of_the_area"])
     for r in rows:
         ws.append(r)
     wb.save(path)
@@ -118,9 +118,13 @@ def append_to_and_update_timestamp(existing_path, new_rows):
     return new_path, appended_count
 
 # ----------------------------
-# Load historical main entries
+# Load historical main entries (simple: by normalized shop name)
 # ----------------------------
 def load_all_previous_entries():
+    """
+    For compatibility and simplicity we use shop name-based historical dedupe.
+    This reads any existing main_*.xlsx files and collects normalized shop names.
+    """
     entries = set()
     for file in os.listdir(OUTPUT_DIR):
         if file.startswith("main_") and file.endswith(".xlsx"):
@@ -130,15 +134,15 @@ def load_all_previous_entries():
                 ws = wb.active
                 for row in ws.iter_rows(min_row=2, values_only=True):
                     shop = (row[1] or "").strip().lower()
-                    location = (row[3] or "").strip()
-                    entries.add((shop, location))
+                    if shop:
+                        entries.add(shop)
                 wb.close()
             except Exception as e:
                 print(f"Warning: couldn't read {path}: {e}")
     return entries
 
 # ----------------------------
-# Area validation helpers  (original)
+# Area validation helpers  (unchanged)
 # ----------------------------
 def is_obviously_invalid_area(area_input):
     if not area_input or not area_input.strip():
@@ -230,18 +234,132 @@ def get_valid_area_from_user(max_attempts=2):
     sys.exit(1)
 
 # ----------------------------
-# Main scraper (flag logic, NO closed-shop filtering)
+# Helper: get textual address/location for area_location column
+# ----------------------------
+def extract_shop_address(page):
+    candidates = [
+        'button[data-item-id^="address:"]',
+        'button[data-item-id="address"]',
+        'button[aria-label^="Address"]',
+        'div.Yr7JMd-pane-hSRGPd',
+        'div.IiD88e',
+        'div[data-section-id="ad"]',
+    ]
+    for sel in candidates:
+        try:
+            locator = page.locator(sel).first
+            if locator and locator.inner_text().strip():
+                return locator.inner_text().strip()
+        except Exception:
+            pass
+    # fallback: try to read text snippet from info pane
+    try:
+        content = page.locator('div.section-hero-header-title').all_text_contents()
+        if content:
+            return " ".join([c.strip() for c in content if c.strip()])
+    except Exception:
+        pass
+    # fallback to current page url if nothing else
+    try:
+        return page.url.strip()
+    except:
+        return "NA"
+
+# ----------------------------
+# Helper: click Share and extract share link from dialog text
+# ----------------------------
+def extract_share_link_from_dialog(page):
+    """
+    Attempts to click the share button and extract the link text inside the dialog.
+    Returns share link string or 'NA' on failure (but falls back to page.url when used).
+    """
+    try:
+        # Try several plausible button selectors
+        share_selectors = [
+            'button[aria-label^="Share"]',
+            'button[aria-label="Share"]',
+            'button[jsaction^="pane.share"]',
+            'button[aria-label*="share"]',
+            'div[aria-label="Share"] button',
+        ]
+        clicked = False
+        for sel in share_selectors:
+            try:
+                btn = page.locator(sel).first
+                if btn and btn.is_visible():
+                    btn.click()
+                    clicked = True
+                    break
+            except Exception:
+                continue
+
+        if not clicked:
+            return "NA"
+
+        # wait for dialog
+        page.wait_for_timeout(1200)
+        # locate any dialog and grab text
+        try:
+            dialog = page.locator('div[role="dialog"]').first
+            dlg_text = dialog.inner_text()
+        except Exception:
+            # fallback to full page
+            dlg_text = page.content()
+
+        # try to find a http(s) link in the dialog content (short maps link or full)
+        m = re.search(r'(https?://\S+)', dlg_text)
+        if m:
+            link = m.group(1).strip().rstrip(')"\'')  # trim trailing punctuation
+            # close dialog by pressing escape
+            try:
+                page.keyboard.press("Escape")
+            except:
+                pass
+            return link
+
+        # fallback: attempt to read an input's value inside the dialog
+        try:
+            inp = dialog.locator('input').first
+            if inp:
+                try:
+                    val = inp.get_attribute('value') or inp.input_value()
+                    if val and val.startswith('http'):
+                        try:
+                            page.keyboard.press("Escape")
+                        except:
+                            pass
+                        return val
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # close dialog
+        try:
+            page.keyboard.press("Escape")
+        except:
+            pass
+
+    except Exception:
+        pass
+
+    return "NA"
+
+# ----------------------------
+# Main scraper (area_location now textual address; new column google_maps_of_the_area)
 # ----------------------------
 def scrape_hot_chips(area, count_needed):
-    historical_set = load_all_previous_entries()
+    # historical dedupe by normalized shop name (simple & robust)
+    historical_names = load_all_previous_entries()
 
     timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
     MAIN_FILE = os.path.join(OUTPUT_DIR, f"main_{timestamp}.xlsx")
     BASE_DUP = base_dup_path()
 
+    # Create main file with new header (added google_maps_of_the_area)
     wb_main = Workbook()
     ws_main = wb_main.active
-    ws_main.append(["date", "shop_name", "phone_number", "area_location"])
+    ws_main.append(["date", "shop_name", "phone_number", "area_location", "google_maps_of_the_area"])
     wb_main.save(MAIN_FILE)
     wb_main.close()
 
@@ -252,7 +370,7 @@ def scrape_hot_chips(area, count_needed):
         browser = p.chromium.launch(headless=False)
         page = browser.new_page()
 
-        # Area-specific search: "hot chips in <area>, Bangalore"
+        # Area-specific search (force area in query)
         query = quote_plus(f"hot chips in {area}, Bangalore")
         search_url = f"https://www.google.com/maps/search/{query}"
         try:
@@ -265,24 +383,23 @@ def scrape_hot_chips(area, count_needed):
                 page.evaluate("document.querySelector('input#searchboxinput').value = arguments[0];",
                               f"hot chips in {area}, Bangalore")
             page.keyboard.press("Enter")
+
         page.wait_for_timeout(5000)
 
-        flag = 0  # starts at 0, increments only when a shop is saved
-        seen_this_run = set()  # avoid reprocessing same shop in same run
+        saved = 0  # count of saved rows
+        seen_this_run = set()  # keep by normalized name to avoid duplicates in same run
 
         # retry counters when results are slow/empty
         empty_retries = 0
-        empty_retries_max = 5
+        empty_retries_max = 6
 
-        # We continue until we saved requested count or we cannot load more results
-        while flag < count_needed:
+        while saved < count_needed:
             shops = page.locator("div.Nv2PK").all()
 
-            # if no shops available, try a few recovery attempts
+            # if empty results, try some recovery attempts
             if not shops:
                 empty_retries += 1
                 if empty_retries <= empty_retries_max:
-                    # try scrolling results pane and waiting
                     try:
                         page.evaluate("window.scrollBy(0, 800);")
                     except:
@@ -290,7 +407,6 @@ def scrape_hot_chips(area, count_needed):
                     page.wait_for_timeout(2500)
                     shops = page.locator("div.Nv2PK").all()
                     if not shops:
-                        # try reload
                         try:
                             page.reload()
                         except:
@@ -303,23 +419,20 @@ def scrape_hot_chips(area, count_needed):
             else:
                 empty_retries = 0
 
-            # iterate visible cards
             for shop in shops:
-                if flag >= count_needed:
+                if saved >= count_needed:
                     break
                 try:
-                    # get shop name robustly
+                    # name extract
                     try:
                         name = shop.locator("div.qBF1Pd").inner_text().strip()
                     except:
                         txt = shop.inner_text().strip()
                         name = txt.splitlines()[0].strip() if txt else "N/A"
+                    norm_name = (name or "N/A").strip().lower()
 
-                    normalized_shop = (name or "N/A").strip().lower()
-
-                    # avoid reprocessing same shop in this run
-                    # use (normalized name + location_url) if available after click; so temporarily skip duplicates by name first
-                    if normalized_shop in seen_this_run:
+                    # skip duplicates within same run
+                    if norm_name in seen_this_run:
                         continue
 
                     # click card
@@ -331,9 +444,24 @@ def scrape_hot_chips(area, count_needed):
                         except:
                             pass
 
-                    page.wait_for_timeout(3000)
+                    page.wait_for_timeout(2500)
 
-                    # extract phone
+                    # get textual address for area_location
+                    try:
+                        address_text = extract_shop_address(page) or ""
+                    except:
+                        address_text = ""
+
+                    # extract share link (google_maps_of_the_area)
+                    share_link = extract_share_link_from_dialog(page)
+                    if not share_link or share_link == "NA":
+                        # fallback to current page url if share link not found
+                        try:
+                            share_link = page.url.strip()
+                        except:
+                            share_link = "NA"
+
+                    # phone extraction (unchanged)
                     phone = "NA"
                     try:
                         tel_links = page.locator('a[href^="tel:"]').all()
@@ -352,51 +480,46 @@ def scrape_hot_chips(area, count_needed):
                         except:
                             pass
 
-                    location_link = page.url.strip()
                     today = datetime.now().strftime("%Y-%m-%d")
 
-                    key = (normalized_shop, location_link)
-
-                    # historical duplicate check
-                    if key in historical_set:
-                        dup_row = (name, phone, location_link)
+                    # historical dedupe by name only (consistent with load_all_previous_entries)
+                    if norm_name in historical_names:
+                        dup_row = (name, phone, address_text, share_link)
                         if dup_row not in dup_seen:
-                            dup_entries.append([today, name, phone, location_link])
+                            dup_entries.append([today, name, phone, address_text, share_link])
                             dup_seen.add(dup_row)
                             print(f"[DUPLICATE] {name}")
-                        seen_this_run.add(normalized_shop)
+                        seen_this_run.add(norm_name)
                         continue
 
-                    # Not a historical duplicate -> save and increment flag
+                    # Save: add row with address_text in area_location and share_link in google_maps_of_the_area
                     try:
                         wb = load_workbook(MAIN_FILE)
                         ws = wb.active
                     except Exception:
                         wb = Workbook()
                         ws = wb.active
-                        ws.append(["date", "shop_name", "phone_number", "area_location"])
+                        ws.append(["date", "shop_name", "phone_number", "area_location", "google_maps_of_the_area"])
 
-                    ws.append([today, name, phone, location_link])
+                    ws.append([today, name, phone, address_text, share_link])
                     wb.save(MAIN_FILE)
                     wb.close()
 
-                    # mark saved and dedupe sets
-                    flag += 1
-                    seen_this_run.add(normalized_shop)
-                    historical_set.add(key)
-                    print(f"Saved: {name} | Phone: {phone} | flag={flag}/{count_needed}")
+                    saved += 1
+                    seen_this_run.add(norm_name)
+                    historical_names.add(norm_name)
+                    print(f"Saved: {name} | Phone: {phone} | saved={saved}/{count_needed}")
 
-                    if flag >= count_needed:
+                    if saved >= count_needed:
                         break
 
                 except Exception as e:
                     print("Error while processing shop:", e)
 
-            # if we reached the target, break
-            if flag >= count_needed:
+            if saved >= count_needed:
                 break
 
-            # try Next page; if no Next, attempt a few scroll/retry cycles; else break
+            # next page or try to load more results
             try:
                 next_btn = page.locator("button[aria-label='Next']").first
                 if next_btn and next_btn.is_visible():
@@ -404,19 +527,19 @@ def scrape_hot_chips(area, count_needed):
                     page.wait_for_timeout(4000)
                     continue
                 else:
-                    # try scroll to load more
+                    # try scroll a few times
                     sc_tries = 0
                     sc_max = 4
                     loaded_more = False
-                    while sc_tries < sc_max and flag < count_needed:
+                    old_count = len(shops)
+                    while sc_tries < sc_max and saved < count_needed:
                         try:
                             page.evaluate("window.scrollBy(0, 900);")
                         except:
                             pass
                         page.wait_for_timeout(3000)
                         new_shops = page.locator("div.Nv2PK").all()
-                        # if new_shops number increased, we loaded more
-                        if new_shops and len(new_shops) > len(shops):
+                        if new_shops and len(new_shops) > old_count:
                             loaded_more = True
                             break
                         sc_tries += 1
@@ -432,7 +555,7 @@ def scrape_hot_chips(area, count_needed):
         browser.close()
 
     # ----------------------------
-    # Duplicate handling (unchanged)
+    # Duplicate handling: same behavior, but now rows include the new column
     # ----------------------------
     latest_ts_dup = find_latest_timestamped_dup()
     base_exists = os.path.exists(BASE_DUP)
@@ -441,7 +564,7 @@ def scrape_hot_chips(area, count_needed):
         if not base_exists and latest_ts_dup is None:
             wb_dup = Workbook()
             ws_dup = wb_dup.active
-            ws_dup.append(["date", "shop_name", "phone_number", "area_location"])
+            ws_dup.append(["date", "shop_name", "phone_number", "area_location", "google_maps_of_the_area"])
             wb_dup.save(BASE_DUP)
             wb_dup.close()
             print(f"\n🆕 Created empty base duplicate file: {BASE_DUP}")
@@ -468,7 +591,7 @@ def scrape_hot_chips(area, count_needed):
                     pass
             print(f"\n⚠️ Duplicate File Created: {new_path}")
 
-    print(f"\n🎉 Main File Created: {MAIN_FILE} (rows saved this run: {flag})")
+    print(f"\n🎉 Main File Created: {MAIN_FILE} (rows saved this run: {saved})")
 
 # ----------------------------
 # Entrypoint
