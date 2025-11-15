@@ -2,7 +2,9 @@ import os
 import re
 import glob
 import sys
+import time
 from datetime import datetime
+from urllib.parse import quote_plus
 from openpyxl import Workbook, load_workbook
 from playwright.sync_api import sync_playwright
 
@@ -16,12 +18,10 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(DUP_DIR, exist_ok=True)
 
 # ----------------------------
-# Phone extraction helper (micro-optimized: compile regex once)
+# Phone extraction helper
 # ----------------------------
-_PHONE_RE = re.compile(r'\d+')
-
 def validate_phone(raw_text):
-    sequences = _PHONE_RE.findall(raw_text or "")
+    sequences = re.findall(r'\d+', (raw_text or ""))
     for seq in sequences:
         digits = "".join(ch for ch in seq if ch.isdigit())
         if 10 <= len(digits) <= 13:
@@ -35,14 +35,12 @@ def base_dup_path():
     return os.path.join(DUP_DIR, "duplicated.xlsx")
 
 def find_latest_timestamped_dup():
-    """
-    Small optimization: use max() instead of sorting the entire list.
-    """
     pattern = os.path.join(DUP_DIR, "duplicated_*.xlsx")
     files = glob.glob(pattern)
     if not files:
         return None
-    return max(files, key=os.path.getmtime)
+    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return files[0]
 
 def is_workbook_empty(path):
     try:
@@ -140,7 +138,7 @@ def load_all_previous_entries():
     return entries
 
 # ----------------------------
-# Area validation helpers (kept behavior exactly the same)
+# Area validation helpers  (original)
 # ----------------------------
 def is_obviously_invalid_area(area_input):
     if not area_input or not area_input.strip():
@@ -160,19 +158,21 @@ def is_obviously_invalid_area(area_input):
     return False
 
 def check_area_on_maps(area_input, headless=True, timeout_ms=8000):
-    """
-    Original behavior preserved exactly: this launches Playwright, navigates, and waits.
-    """
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=headless)
             page = browser.new_page()
-            page.goto("https://www.google.com/maps")
+            q = quote_plus(area_input)
+            search_url = f"https://www.google.com/maps/search/{q}"
             try:
-                page.fill("input#searchboxinput", area_input)
+                page.goto(search_url)
             except Exception:
-                page.evaluate("document.querySelector('input#searchboxinput').value = arguments[0];", area_input)
-            page.keyboard.press("Enter")
+                page.goto("https://www.google.com/maps")
+                try:
+                    page.fill("input#searchboxinput", area_input)
+                except Exception:
+                    page.evaluate("document.querySelector('input#searchboxinput').value = arguments[0];", area_input)
+                page.keyboard.press("Enter")
             page.wait_for_timeout(timeout_ms)
 
             try:
@@ -203,86 +203,34 @@ def check_area_on_maps(area_input, headless=True, timeout_ms=8000):
 
     return False
 
-def check_area_on_maps_page(page, area_input, timeout_ms=8000):
-    """
-    Same checks as check_area_on_maps but operates on an existing Playwright page instance.
-    This allows reusing a single browser/page to avoid repeated launches in get_valid_area_from_user.
-    Functionality and waits are unchanged.
-    """
-    try:
-        page.goto("https://www.google.com/maps")
-        try:
-            page.fill("input#searchboxinput", area_input)
-        except Exception:
-            page.evaluate("document.querySelector('input#searchboxinput').value = arguments[0];", area_input)
-        page.keyboard.press("Enter")
-        page.wait_for_timeout(timeout_ms)
-
-        try:
-            cards = page.locator("div.Nv2PK")
-            if cards.count() and cards.count() > 0:
-                return True
-        except Exception:
-            pass
-
-        try:
-            content = page.content().lower()
-            if "no results found" in content or "did not match" in content:
-                return False
-        except Exception:
-            pass
-
-        url = page.url.lower()
-        if "/search/" in url or "/place/" in url:
-            return True
-    except Exception as e:
-        print(f"Warning: area validation (page) error: {e}")
-        return False
-
-    return False
-
 def get_valid_area_from_user(max_attempts=2):
-    """
-    Micro-optimized: reuse a single Playwright browser/page across attempts.
-    Behavior (waits & selectors) remains identical to original.
-    """
     attempt = 0
-    # We'll launch the browser once, use for up to max_attempts, then close
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+    while attempt < max_attempts:
+        area_input = input("Enter area (spelling can be wrong, script will correct): ").strip()
+        attempt += 1
 
-        while attempt < max_attempts:
-            area_input = input("Enter area (spelling can be wrong, script will correct): ").strip()
-            attempt += 1
-
-            if is_obviously_invalid_area(area_input):
-                print("Please enter a valid place name. Try again.")
-                if attempt >= max_attempts:
-                    print("Unable to locate the area on Google Maps. Exiting.")
-                    browser.close()
-                    sys.exit(1)
-                continue
-
-            # use the page-based checker which has identical checks/waits as the original
-            if check_area_on_maps_page(page, area_input, timeout_ms=8000):
-                browser.close()
-                return area_input
-            else:
-                if attempt < max_attempts:
-                    print(f"The place '{area_input}' does not appear to exist in Bangalore.")
-                    print("Enter the correct area name within Bangalore:")
-                    continue
-                print("Unable to locate the area. Exiting.")
-                browser.close()
+        if is_obviously_invalid_area(area_input):
+            print("Please enter a valid place name. Try again.")
+            if attempt >= max_attempts:
+                print("Unable to locate the area on Google Maps. Exiting.")
                 sys.exit(1)
+            continue
 
-        print("Area validation failed. Exiting.")
-        browser.close()
-        sys.exit(1)
+        if check_area_on_maps(area_input, headless=True):
+            return area_input
+        else:
+            if attempt < max_attempts:
+                print(f"The place '{area_input}' does not appear to exist in Bangalore.")
+                print("Enter the correct area name within Bangalore:")
+                continue
+            print("Unable to locate the area. Exiting.")
+            sys.exit(1)
+
+    print("Area validation failed. Exiting.")
+    sys.exit(1)
 
 # ----------------------------
-# Main scraper (kept unchanged in behavior)
+# Main scraper (flag logic, NO closed-shop filtering)
 # ----------------------------
 def scrape_hot_chips(area, count_needed):
     historical_set = load_all_previous_entries()
@@ -298,51 +246,100 @@ def scrape_hot_chips(area, count_needed):
     wb_main.close()
 
     dup_entries = []
+    dup_seen = set()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
         page = browser.new_page()
 
-        page.goto("https://www.google.com/maps")
-        page.fill("input#searchboxinput", area)
-        page.keyboard.press("Enter")
+        # Area-specific search: "hot chips in <area>, Bangalore"
+        query = quote_plus(f"hot chips in {area}, Bangalore")
+        search_url = f"https://www.google.com/maps/search/{query}"
+        try:
+            page.goto(search_url)
+        except Exception:
+            page.goto("https://www.google.com/maps")
+            try:
+                page.fill("input#searchboxinput", f"hot chips in {area}, Bangalore")
+            except Exception:
+                page.evaluate("document.querySelector('input#searchboxinput').value = arguments[0];",
+                              f"hot chips in {area}, Bangalore")
+            page.keyboard.press("Enter")
         page.wait_for_timeout(5000)
 
-        page.fill("input#searchboxinput", "")
-        page.fill("input#searchboxinput", "hot chips near me")
-        page.keyboard.press("Enter")
-        page.wait_for_timeout(6000)
+        flag = 0  # starts at 0, increments only when a shop is saved
+        seen_this_run = set()  # avoid reprocessing same shop in same run
 
-        num_scraped = 0
-        while num_scraped < count_needed:
+        # retry counters when results are slow/empty
+        empty_retries = 0
+        empty_retries_max = 5
+
+        # We continue until we saved requested count or we cannot load more results
+        while flag < count_needed:
             shops = page.locator("div.Nv2PK").all()
-            if not shops:
-                break
 
+            # if no shops available, try a few recovery attempts
+            if not shops:
+                empty_retries += 1
+                if empty_retries <= empty_retries_max:
+                    # try scrolling results pane and waiting
+                    try:
+                        page.evaluate("window.scrollBy(0, 800);")
+                    except:
+                        pass
+                    page.wait_for_timeout(2500)
+                    shops = page.locator("div.Nv2PK").all()
+                    if not shops:
+                        # try reload
+                        try:
+                            page.reload()
+                        except:
+                            pass
+                        page.wait_for_timeout(3500)
+                        shops = page.locator("div.Nv2PK").all()
+                else:
+                    print("No shop cards found after retries — stopping.")
+                    break
+            else:
+                empty_retries = 0
+
+            # iterate visible cards
             for shop in shops:
-                if num_scraped >= count_needed:
+                if flag >= count_needed:
                     break
                 try:
+                    # get shop name robustly
                     try:
                         name = shop.locator("div.qBF1Pd").inner_text().strip()
                     except:
                         txt = shop.inner_text().strip()
                         name = txt.splitlines()[0].strip() if txt else "N/A"
 
+                    normalized_shop = (name or "N/A").strip().lower()
+
+                    # avoid reprocessing same shop in this run
+                    # use (normalized name + location_url) if available after click; so temporarily skip duplicates by name first
+                    if normalized_shop in seen_this_run:
+                        continue
+
+                    # click card
                     try:
                         shop.click()
                     except:
-                        page.evaluate("arguments[0].click();", shop)
+                        try:
+                            page.evaluate("arguments[0].click();", shop)
+                        except:
+                            pass
 
                     page.wait_for_timeout(3000)
 
+                    # extract phone
                     phone = "NA"
                     try:
                         tel_links = page.locator('a[href^="tel:"]').all()
                         if tel_links:
                             href = tel_links[0].get_attribute("href") or ""
                             phone = validate_phone(href)
-
                     except:
                         pass
 
@@ -357,38 +354,86 @@ def scrape_hot_chips(area, count_needed):
 
                     location_link = page.url.strip()
                     today = datetime.now().strftime("%Y-%m-%d")
-                    normalized_shop = (name or "N/A").strip().lower()
 
-                    if (normalized_shop, location_link) in historical_set:
-                        dup_entries.append([today, name, phone, location_link])
-                        print(f"[DUPLICATE] {name}")
-                    else:
+                    key = (normalized_shop, location_link)
+
+                    # historical duplicate check
+                    if key in historical_set:
+                        dup_row = (name, phone, location_link)
+                        if dup_row not in dup_seen:
+                            dup_entries.append([today, name, phone, location_link])
+                            dup_seen.add(dup_row)
+                            print(f"[DUPLICATE] {name}")
+                        seen_this_run.add(normalized_shop)
+                        continue
+
+                    # Not a historical duplicate -> save and increment flag
+                    try:
                         wb = load_workbook(MAIN_FILE)
                         ws = wb.active
-                        ws.append([today, name, phone, location_link])
-                        wb.save(MAIN_FILE)
-                        wb.close()
-                        historical_set.add((normalized_shop, location_link))
+                    except Exception:
+                        wb = Workbook()
+                        ws = wb.active
+                        ws.append(["date", "shop_name", "phone_number", "area_location"])
 
-                    num_scraped += 1
-                    print(f"Saved: {name} | Phone: {phone}")
+                    ws.append([today, name, phone, location_link])
+                    wb.save(MAIN_FILE)
+                    wb.close()
+
+                    # mark saved and dedupe sets
+                    flag += 1
+                    seen_this_run.add(normalized_shop)
+                    historical_set.add(key)
+                    print(f"Saved: {name} | Phone: {phone} | flag={flag}/{count_needed}")
+
+                    if flag >= count_needed:
+                        break
 
                 except Exception as e:
                     print("Error while processing shop:", e)
 
+            # if we reached the target, break
+            if flag >= count_needed:
+                break
+
+            # try Next page; if no Next, attempt a few scroll/retry cycles; else break
             try:
                 next_btn = page.locator("button[aria-label='Next']").first
-                if next_btn.is_visible():
+                if next_btn and next_btn.is_visible():
                     next_btn.click()
                     page.wait_for_timeout(4000)
                     continue
-            except:
-                pass
-
-            break
+                else:
+                    # try scroll to load more
+                    sc_tries = 0
+                    sc_max = 4
+                    loaded_more = False
+                    while sc_tries < sc_max and flag < count_needed:
+                        try:
+                            page.evaluate("window.scrollBy(0, 900);")
+                        except:
+                            pass
+                        page.wait_for_timeout(3000)
+                        new_shops = page.locator("div.Nv2PK").all()
+                        # if new_shops number increased, we loaded more
+                        if new_shops and len(new_shops) > len(shops):
+                            loaded_more = True
+                            break
+                        sc_tries += 1
+                    if loaded_more:
+                        continue
+                    # nothing more to load
+                    print("No more result pages/cards available.")
+                    break
+            except Exception:
+                print("Couldn't navigate to next page or load more results.")
+                break
 
         browser.close()
 
+    # ----------------------------
+    # Duplicate handling (unchanged)
+    # ----------------------------
     latest_ts_dup = find_latest_timestamped_dup()
     base_exists = os.path.exists(BASE_DUP)
 
@@ -423,7 +468,7 @@ def scrape_hot_chips(area, count_needed):
                     pass
             print(f"\n⚠️ Duplicate File Created: {new_path}")
 
-    print(f"\n🎉 Main File Created: {MAIN_FILE}")
+    print(f"\n🎉 Main File Created: {MAIN_FILE} (rows saved this run: {flag})")
 
 # ----------------------------
 # Entrypoint
@@ -431,9 +476,6 @@ def scrape_hot_chips(area, count_needed):
 if __name__ == "__main__":
     area = get_valid_area_from_user(max_attempts=2)
 
-    # ----------------------------
-    # UPDATED LOGIC (your request)
-    # ----------------------------
     while True:
         count_input = input("How many shops to scrape?: ").strip()
         if count_input.isdigit():
