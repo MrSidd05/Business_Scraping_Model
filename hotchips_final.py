@@ -16,10 +16,12 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(DUP_DIR, exist_ok=True)
 
 # ----------------------------
-# Phone extraction helper
+# Phone extraction helper (micro-optimized: compile regex once)
 # ----------------------------
+_PHONE_RE = re.compile(r'\d+')
+
 def validate_phone(raw_text):
-    sequences = re.findall(r'\d+', (raw_text or ""))
+    sequences = _PHONE_RE.findall(raw_text or "")
     for seq in sequences:
         digits = "".join(ch for ch in seq if ch.isdigit())
         if 10 <= len(digits) <= 13:
@@ -33,12 +35,14 @@ def base_dup_path():
     return os.path.join(DUP_DIR, "duplicated.xlsx")
 
 def find_latest_timestamped_dup():
+    """
+    Small optimization: use max() instead of sorting the entire list.
+    """
     pattern = os.path.join(DUP_DIR, "duplicated_*.xlsx")
     files = glob.glob(pattern)
     if not files:
         return None
-    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return files[0]
+    return max(files, key=os.path.getmtime)
 
 def is_workbook_empty(path):
     try:
@@ -136,7 +140,7 @@ def load_all_previous_entries():
     return entries
 
 # ----------------------------
-# Area validation helpers
+# Area validation helpers (kept behavior exactly the same)
 # ----------------------------
 def is_obviously_invalid_area(area_input):
     if not area_input or not area_input.strip():
@@ -156,6 +160,9 @@ def is_obviously_invalid_area(area_input):
     return False
 
 def check_area_on_maps(area_input, headless=True, timeout_ms=8000):
+    """
+    Original behavior preserved exactly: this launches Playwright, navigates, and waits.
+    """
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=headless)
@@ -196,34 +203,86 @@ def check_area_on_maps(area_input, headless=True, timeout_ms=8000):
 
     return False
 
+def check_area_on_maps_page(page, area_input, timeout_ms=8000):
+    """
+    Same checks as check_area_on_maps but operates on an existing Playwright page instance.
+    This allows reusing a single browser/page to avoid repeated launches in get_valid_area_from_user.
+    Functionality and waits are unchanged.
+    """
+    try:
+        page.goto("https://www.google.com/maps")
+        try:
+            page.fill("input#searchboxinput", area_input)
+        except Exception:
+            page.evaluate("document.querySelector('input#searchboxinput').value = arguments[0];", area_input)
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(timeout_ms)
+
+        try:
+            cards = page.locator("div.Nv2PK")
+            if cards.count() and cards.count() > 0:
+                return True
+        except Exception:
+            pass
+
+        try:
+            content = page.content().lower()
+            if "no results found" in content or "did not match" in content:
+                return False
+        except Exception:
+            pass
+
+        url = page.url.lower()
+        if "/search/" in url or "/place/" in url:
+            return True
+    except Exception as e:
+        print(f"Warning: area validation (page) error: {e}")
+        return False
+
+    return False
+
 def get_valid_area_from_user(max_attempts=2):
+    """
+    Micro-optimized: reuse a single Playwright browser/page across attempts.
+    Behavior (waits & selectors) remains identical to original.
+    """
     attempt = 0
-    while attempt < max_attempts:
-        area_input = input("Enter area (spelling can be wrong, script will correct): ").strip()
-        attempt += 1
+    # We'll launch the browser once, use for up to max_attempts, then close
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
 
-        if is_obviously_invalid_area(area_input):
-            print("Please enter a valid place name. Try again.")
-            if attempt >= max_attempts:
-                print("Unable to locate the area on Google Maps. Exiting.")
-                sys.exit(1)
-            continue
+        while attempt < max_attempts:
+            area_input = input("Enter area (spelling can be wrong, script will correct): ").strip()
+            attempt += 1
 
-        if check_area_on_maps(area_input, headless=True):
-            return area_input
-        else:
-            if attempt < max_attempts:
-                print(f"The place '{area_input}' does not appear to exist in Bangalore.")
-                print("Enter the correct area name within Bangalore:")
+            if is_obviously_invalid_area(area_input):
+                print("Please enter a valid place name. Try again.")
+                if attempt >= max_attempts:
+                    print("Unable to locate the area on Google Maps. Exiting.")
+                    browser.close()
+                    sys.exit(1)
                 continue
-            print("Unable to locate the area. Exiting.")
-            sys.exit(1)
 
-    print("Area validation failed. Exiting.")
-    sys.exit(1)
+            # use the page-based checker which has identical checks/waits as the original
+            if check_area_on_maps_page(page, area_input, timeout_ms=8000):
+                browser.close()
+                return area_input
+            else:
+                if attempt < max_attempts:
+                    print(f"The place '{area_input}' does not appear to exist in Bangalore.")
+                    print("Enter the correct area name within Bangalore:")
+                    continue
+                print("Unable to locate the area. Exiting.")
+                browser.close()
+                sys.exit(1)
+
+        print("Area validation failed. Exiting.")
+        browser.close()
+        sys.exit(1)
 
 # ----------------------------
-# Main scraper
+# Main scraper (kept unchanged in behavior)
 # ----------------------------
 def scrape_hot_chips(area, count_needed):
     historical_set = load_all_previous_entries()
