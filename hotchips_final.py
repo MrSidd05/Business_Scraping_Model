@@ -23,6 +23,24 @@ os.makedirs(DEBUG_DIR, exist_ok=True)
 LINK_FONT = Font(color="0000FF", underline="single")
 
 # ----------------------------
+# Filtering keywords: only keep places that look like 'hot chips' / 'chips shop' / 'fries'
+# Anything not matching these will be excluded (your request: exclude = anything apart from hot chips)
+# ----------------------------
+INCLUDE_KEYWORDS = [
+    "hot chips", "chips shop", "chips", "fries", "french fries", "hotchip", "hot-chip", "potato fries",
+    "crispy fries", "masala fries", "aloo fries", "chips corner", "chips stall", "chips counter",
+    "fry shop", "fry stall", "frenchfries"
+]
+
+# Optional explicit exclude list for quicker skips (not the only guard — final decision requires INCLUDE keywords)
+EXCLUDE_KEYWORDS = [
+    "restaurant", "hotel", "dhaba", "bar", "lounge", "pub", "cafe", "shawarma",
+    "biryani", "tandoor", "mess", "bakery", "sweet", "ice cream", "juice", "barbecue",
+    "barbeque", "pizz", "pasta", "sweets", "samosa", "vada pav", "sandwich", "chinese",
+    "south indian", "north indian", "canteen", "canteen", "mess", "cater", "catering"
+]
+
+# ----------------------------
 # Helpers
 # ----------------------------
 def now_ts():
@@ -348,9 +366,10 @@ def extract_share_link_from_dialog(page):
     return "NA"
 
 # ----------------------------
-# MAIN: improved extraction + exact place URL feature
+# MAIN: improved extraction + exact place URL feature + strict chips-only filter
 # ----------------------------
 def scrape_hot_chips(area, count_needed):
+    # keep historical names only for duplicate-recording, but DO NOT skip saving if historically seen
     historical_names = load_all_previous_entries()
 
     timestamp = now_ts()
@@ -366,7 +385,6 @@ def scrape_hot_chips(area, count_needed):
     dup_entries = []
     dup_seen = set()
     saved = 0
-    seen_this_run = set()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
@@ -389,6 +407,9 @@ def scrape_hot_chips(area, count_needed):
         empty_retries = 0
         empty_retries_max = 6
 
+        card_index = 0  # pointer walking top->down across the dynamic list
+
+        # We'll run until we've saved count_needed rows or until no more results can be loaded
         while saved < count_needed:
             try:
                 total_cards = page.locator("div.Nv2PK").count()
@@ -423,243 +444,269 @@ def scrape_hot_chips(area, count_needed):
             else:
                 empty_retries = 0
 
-            for idx in range(total_cards):
-                if saved >= count_needed:
+            # If our pointer reached end of currently loaded cards, try to load more and continue
+            if card_index >= total_cards:
+                # try to scroll/load more
+                sc_tries = 0
+                sc_max = 6
+                loaded_more = False
+                old_count = total_cards
+                while sc_tries < sc_max and saved < count_needed:
+                    try:
+                        page.evaluate("window.scrollBy(0, 900);")
+                    except:
+                        pass
+                    page.wait_for_timeout(1000)
+                    try:
+                        new_total = page.locator("div.Nv2PK").count()
+                    except:
+                        new_total = old_count
+                    if new_total and new_total > old_count:
+                        loaded_more = True
+                        break
+                    sc_tries += 1
+                if not loaded_more:
+                    # attempt Next button once
+                    try:
+                        next_btn = page.locator("button[aria-label='Next']").first
+                        if next_btn and next_btn.is_visible():
+                            next_btn.click()
+                            page.wait_for_timeout(1200)
+                            card_index = 0
+                            continue
+                    except:
+                        pass
+                    print("No more result pages/cards available.")
                     break
+                else:
+                    # more loaded: continue loop (card_index remains where it was)
+                    continue
+
+            # Re-fetch the card locator at current index (ensures we click the current visible card)
+            try:
+                shop_el = page.locator("div.Nv2PK").nth(card_index)
+            except Exception as e:
+                print(f"Couldn't fetch card at index {card_index}: {e}")
+                card_index += 1
+                continue
+
+            try:
+                # quick text from card (fast) - used for include/exclude filtering BEFORE clicking
                 try:
-                    shop_el = page.locator("div.Nv2PK").nth(idx)
+                    card_text = shop_el.inner_text().strip().lower() or ""
+                except Exception:
+                    card_text = ""
 
-                    # quick name from card (fast)
-                    name = "N/A"
+                # STRICT pre-filter: if card text doesn't include any include keywords, skip it.
+                # This enforces "exclude anything apart from hot chips".
+                if not any(kw in card_text for kw in INCLUDE_KEYWORDS):
+                    # If card_text is empty or ambiguous, optionally still click, but here we will skip to be strict.
+                    print(f"Skipping (pre-filter strict) index {card_index} — not a chips shop: '{card_text.splitlines()[0] if card_text else 'unknown'}'")
+                    card_index += 1
+                    continue
+
+                # quick name from card (fallback/gathering)
+                name = "N/A"
+                try:
+                    name = shop_el.locator("div.qBF1Pd").inner_text().strip()
+                except:
                     try:
-                        name = shop_el.locator("div.qBF1Pd").inner_text().strip()
+                        txt = shop_el.inner_text().strip()
+                        name = txt.splitlines()[0].strip() if txt else "N/A"
                     except:
-                        try:
-                            txt = shop_el.inner_text().strip()
-                            name = txt.splitlines()[0].strip() if txt else "N/A"
-                        except:
-                            name = "N/A"
-                    norm_name = (name or "N/A").strip().lower()
-                    if norm_name in seen_this_run:
-                        continue
+                        name = "N/A"
 
-                    # click to open pane
+                # click to open pane (synchronously)
+                try:
+                    shop_el.click()
+                except:
                     try:
-                        shop_el.click()
+                        page.evaluate("arguments[0].click();", shop_el)
                     except:
-                        try:
-                            page.evaluate("arguments[0].click();", shop_el)
-                        except:
-                            pass
-
-                    # Wait for important nodes; slightly generous to avoid missing lazy nodes
-                    try:
-                        page.wait_for_selector(
-                            'div.section-hero-header-title, a[href^="tel:"], button[data-item-id^="phone:"], button[aria-label*="Copy address"], div[role="dialog"]',
-                            timeout=2000
-                        )
-                    except:
-                        page.wait_for_timeout(900)
-
-                    # single evaluate harvest of many candidates
-                    try:
-                        harvested = page.evaluate(
-                            """() => {
-                                const out = { address: '', pageUrl: window.location.href || '', telCandidates: [], shareText: '', paneText: '' };
-                                const addrSelectors = [
-                                    'button[data-item-id^=\"address:\"]',
-                                    'button[data-item-id=\"address\"]',
-                                    'button[aria-label^=\"Address\"]',
-                                    'div.Yr7JMd-pane-hSRGPd',
-                                    'div.IiD88e',
-                                    'div[data-section-id=\"ad"]',
-                                    'button[aria-label*=\"Copy address\"]',
-                                    'div.section-hero-header-title'
-                                ];
-                                for (const sel of addrSelectors) {
-                                    try {
-                                        const el = document.querySelector(sel);
-                                        if (el && el.innerText && el.innerText.trim().length>0) {
-                                            out.address = el.innerText.trim();
-                                            break;
-                                        }
-                                    } catch(e){}
-                                }
-                                try {
-                                    const pane = document.querySelector('div.section-hero-text-content') || document.querySelector('div.section-hero-header-title');
-                                    if (pane) out.paneText = (pane.innerText || '').trim();
-                                } catch(e){}
-                                try {
-                                    const tels = Array.from(document.querySelectorAll('a[href^=\"tel:\"]'));
-                                    for (const t of tels) out.telCandidates.push(t.getAttribute('href') || t.innerText || '');
-                                } catch(e){}
-                                try {
-                                    const phoneBtns = Array.from(document.querySelectorAll('button[data-item-id^=\"phone:\"], button[aria-label*=\"Call\"], button[aria-label*=\"Phone\"]'));
-                                    for (const b of phoneBtns) out.telCandidates.push(b.innerText || b.getAttribute('aria-label') || '');
-                                } catch(e){}
-                                try {
-                                    const dlg = document.querySelector('div[role=\"dialog\"]');
-                                    if (dlg) out.shareText = (dlg.innerText || '').trim();
-                                } catch(e){}
-                                return out;
-                            }"""
-                        )
-                    except Exception:
-                        harvested = {"address": "", "pageUrl": page.url, "telCandidates": [], "shareText": "", "paneText": ""}
-
-                    address_text = (harvested.get("address") or "").strip()
-                    current_url = (harvested.get("pageUrl") or page.url or "").strip()
-                    tel_candidates = harvested.get("telCandidates") or []
-                    share_dialog_text = (harvested.get("shareText") or "").strip()
-                    pane_text = (harvested.get("paneText") or "").strip()
-
-                    # Normalize phone
-                    phone = "NA"
-                    for cand in tel_candidates:
-                        ph = validate_phone(cand)
-                        if ph != "NA":
-                            phone = ph
-                            break
-                    if phone == "NA" and share_dialog_text:
-                        phone = validate_phone(share_dialog_text)
-                    if phone == "NA":
-                        phone = validate_phone(pane_text)
-
-                    # --- NEW: try to get exact place URL (prefer current_url if already place/coords) ---
-                    exact_place_url = ""
-                    # prefer current_url if it looks like a place url or contains coords
-                    if current_url and ("/place/" in current_url or "@"+"" in current_url or re.search(r'!3d-?\d', current_url)):
-                        exact_place_url = current_url
-                    else:
-                        # try to extract coords from current_url first
-                        ccoords = extract_coords_from_url(current_url)
-                        if ccoords:
-                            exact_place_url = current_url
-                        else:
-                            # fallback: try share dialog extraction (only if we don't already have a place URL)
-                            try:
-                                share_link = extract_share_link_from_dialog(page)
-                                if share_link and share_link != "NA":
-                                    exact_place_url = share_link
-                                else:
-                                    exact_place_url = current_url or "NA"
-                            except:
-                                exact_place_url = current_url or "NA"
-
-                    # coords field (as before) - keep for backwards compat
-                    coords = extract_coords_from_url(exact_place_url) or extract_coords_from_url(current_url)
-                    google_maps_loc = exact_place_url if exact_place_url else (current_url or "NA")
-
-                    # fallback for address (slower) only if empty
-                    if not address_text:
-                        try:
-                            fallback = extract_shop_address(page)
-                            if fallback and fallback.strip():
-                                address_text = fallback
-                        except:
-                            pass
-
-                    # If still missing phone or address — save debug screenshot
-                    need_debug = (not phone or phone == "NA") or (not address_text or address_text.strip() == "")
-                    debug_path = None
-                    if need_debug:
-                        safe_name = re.sub(r'\W+', '_', name)[:30]
-                        debug_path = os.path.join(DEBUG_DIR, f"{now_ts()}_idx{idx}_{safe_name}.png")
-                        try:
-                            page.screenshot(path=debug_path, full_page=False)
-                        except:
-                            debug_path = None
-
-                    today = datetime.now().strftime("%Y-%m-%d")
-
-                    # record duplicate info if historically seen, but still write to main file
-                    if norm_name in historical_names:
-                        dup_row = (name, phone, address_text, google_maps_loc)
-                        if dup_row not in dup_seen:
-                            dup_entries.append([today, name, phone, address_text, google_maps_loc])
-                            dup_seen.add(dup_row)
-                            print(f"[DUP-RECORDED] {name}")
-
-                    # Save to main file (append then set hyperlink on last column if URL)
-                    try:
-                        wb = load_workbook(MAIN_FILE)
-                        ws = wb.active
-                    except Exception:
-                        wb = Workbook()
-                        ws = wb.active
-                        ws.append(["date", "shop_name", "phone_number", "area_location", "google_maps_of_the_area"])
-
-                    ws.append([today, name, phone, address_text, google_maps_loc])
-                    # set hyperlink if google_maps_loc looks like a URL
-                    try:
-                        r_idx = ws.max_row
-                        url_val = (google_maps_loc or "").strip()
-                        if url_val and url_val.upper() != "NA" and url_val.lower().startswith("http"):
-                            cell = ws.cell(row=r_idx, column=5)
-                            cell.value = url_val
-                            cell.hyperlink = url_val
-                            cell.font = LINK_FONT
-                    except Exception:
                         pass
 
-                    wb.save(MAIN_FILE)
-                    wb.close()
+                # Wait for important nodes; slightly generous to avoid missing lazy nodes
+                try:
+                    page.wait_for_selector(
+                        'div.section-hero-header-title, a[href^="tel:"], button[data-item-id^="phone:"], button[aria-label*="Copy address"], div[role="dialog"]',
+                        timeout=2000
+                    )
+                except:
+                    page.wait_for_timeout(900)
 
-                    saved += 1
-                    seen_this_run.add(norm_name)
-                    historical_names.add(norm_name)
+                # single evaluate harvest of many candidates
+                try:
+                    harvested = page.evaluate(
+                        """() => {
+                            const out = { address: '', pageUrl: window.location.href || '', telCandidates: [], shareText: '', paneText: '' };
+                            const addrSelectors = [
+                                'button[data-item-id^="address:"]',
+                                'button[data-item-id="address"]',
+                                'button[aria-label^="Address"]',
+                                'div.Yr7JMd-pane-hSRGPd',
+                                'div.IiD88e',
+                                'div[data-section-id="ad"]',
+                                'button[aria-label*="Copy address"]',
+                                'div.section-hero-header-title'
+                            ];
+                            for (const sel of addrSelectors) {
+                                try {
+                                    const el = document.querySelector(sel);
+                                    if (el && el.innerText && el.innerText.trim().length>0) {
+                                        out.address = el.innerText.trim();
+                                        break;
+                                    }
+                                } catch(e){}
+                            }
+                            try {
+                                const pane = document.querySelector('div.section-hero-text-content') || document.querySelector('div.section-hero-header-title');
+                                if (pane) out.paneText = (pane.innerText || '').trim();
+                            } catch(e){}
+                            try {
+                                const tels = Array.from(document.querySelectorAll('a[href^="tel:"]'));
+                                for (const t of tels) out.telCandidates.push(t.getAttribute('href') || t.innerText || '');
+                            } catch(e){}
+                            try {
+                                const phoneBtns = Array.from(document.querySelectorAll('button[data-item-id^="phone:"], button[aria-label*="Call"], button[aria-label*="Phone"]'));
+                                for (const b of phoneBtns) out.telCandidates.push(b.innerText || b.getAttribute('aria-label') || '');
+                            } catch(e){}
+                            try {
+                                const dlg = document.querySelector('div[role="dialog"]');
+                                if (dlg) out.shareText = (dlg.innerText || '').trim();
+                            } catch(e){}
+                            return out;
+                        }"""
+                    )
+                except Exception:
+                    harvested = {"address": "", "pageUrl": page.url, "telCandidates": [], "shareText": "", "paneText": ""}
 
-                    print(f"Saved: {name} | phone:{phone} | addr_present:{bool(address_text)} | loc:{google_maps_loc} | saved={saved}/{count_needed}")
-                    if debug_path:
-                        print(f" -> saved debug screenshot: {debug_path}")
+                address_text = (harvested.get("address") or "").strip()
+                current_url = (harvested.get("pageUrl") or page.url or "").strip()
+                tel_candidates = harvested.get("telCandidates") or []
+                share_dialog_text = (harvested.get("shareText") or "").strip()
+                pane_text = (harvested.get("paneText") or "").strip()
 
-                    if saved >= count_needed:
-                        break
-
-                except Exception as e:
-                    print("Error while processing shop:", e)
+                # --- POST-OPEN STRICT FILTER: ensure detail pane also contains include keywords ---
+                combined_text = " ".join(filter(None, [card_text, pane_text, address_text, share_dialog_text])).lower()
+                if not any(kw in combined_text for kw in INCLUDE_KEYWORDS):
+                    print(f"Skipping (post-filter strict) index {card_index} — detail doesn't look like chips shop. Sample: '{(pane_text or card_text)[:80]}'")
                     try:
                         page.keyboard.press("Escape")
                     except:
                         pass
+                    card_index += 1
                     continue
 
-            if saved >= count_needed:
-                break
+                # Normalize phone
+                phone = "NA"
+                for cand in tel_candidates:
+                    ph = validate_phone(cand)
+                    if ph != "NA":
+                        phone = ph
+                        break
+                if phone == "NA" and share_dialog_text:
+                    phone = validate_phone(share_dialog_text)
+                if phone == "NA":
+                    phone = validate_phone(pane_text)
 
-            # try next or load more
-            try:
-                next_btn = page.locator("button[aria-label='Next']").first
-                if next_btn and next_btn.is_visible():
-                    next_btn.click()
-                    page.wait_for_timeout(1000)
-                    continue
+                # --- get exact place URL (prefer current_url if already place/coords) ---
+                exact_place_url = ""
+                if current_url and ("/place/" in current_url or "@"+"" in current_url or re.search(r'!3d-?\d', current_url)):
+                    exact_place_url = current_url
                 else:
-                    sc_tries = 0
-                    sc_max = 4
-                    loaded_more = False
-                    old_count = total_cards
-                    while sc_tries < sc_max and saved < count_needed:
+                    ccoords = extract_coords_from_url(current_url)
+                    if ccoords:
+                        exact_place_url = current_url
+                    else:
                         try:
-                            page.evaluate("window.scrollBy(0, 900);")
+                            share_link = extract_share_link_from_dialog(page)
+                            if share_link and share_link != "NA":
+                                exact_place_url = share_link
+                            else:
+                                exact_place_url = current_url or "NA"
                         except:
-                            pass
-                        page.wait_for_timeout(800)
-                        try:
-                            new_total = page.locator("div.Nv2PK").count()
-                        except:
-                            new_total = old_count
-                        if new_total and new_total > old_count:
-                            loaded_more = True
-                            break
-                        sc_tries += 1
-                    if loaded_more:
-                        continue
-                    print("No more result pages/cards available.")
+                            exact_place_url = current_url or "NA"
+
+                coords = extract_coords_from_url(exact_place_url) or extract_coords_from_url(current_url)
+                google_maps_loc = exact_place_url if exact_place_url else (current_url or "NA")
+
+                # fallback for address (slower) only if empty
+                if not address_text:
+                    try:
+                        fallback = extract_shop_address(page)
+                        if fallback and fallback.strip():
+                            address_text = fallback
+                    except:
+                        pass
+
+                # If still missing phone or address — save debug screenshot
+                need_debug = (not phone or phone == "NA") or (not address_text or address_text.strip() == "")
+                debug_path = None
+                if need_debug:
+                    safe_name = re.sub(r'\W+', '_', name)[:30]
+                    debug_path = os.path.join(DEBUG_DIR, f"{now_ts()}_idx{card_index}_{safe_name}.png")
+                    try:
+                        page.screenshot(path=debug_path, full_page=False)
+                    except:
+                        debug_path = None
+
+                today = datetime.now().strftime("%Y-%m-%d")
+
+                # record duplicate info if historically seen, but DO NOT skip saving
+                norm_name = (name or "N/A").strip().lower()
+                if norm_name in historical_names:
+                    dup_row = (name, phone, address_text, google_maps_loc)
+                    if dup_row not in dup_seen:
+                        dup_entries.append([today, name, phone, address_text, google_maps_loc])
+                        dup_seen.add(dup_row)
+                        print(f"[DUP-RECORDED] {name}")
+
+                # Save to main file (append then set hyperlink on last column if URL)
+                try:
+                    wb = load_workbook(MAIN_FILE)
+                    ws = wb.active
+                except Exception:
+                    wb = Workbook()
+                    ws = wb.active
+                    ws.append(["date", "shop_name", "phone_number", "area_location", "google_maps_of_the_area"])
+
+                ws.append([today, name, phone, address_text, google_maps_loc])
+                # set hyperlink if google_maps_loc looks like a URL
+                try:
+                    r_idx = ws.max_row
+                    url_val = (google_maps_loc or "").strip()
+                    if url_val and url_val.upper() != "NA" and url_val.lower().startswith("http"):
+                        cell = ws.cell(row=r_idx, column=5)
+                        cell.value = url_val
+                        cell.hyperlink = url_val
+                        cell.font = LINK_FONT
+                except Exception:
+                    pass
+
+                wb.save(MAIN_FILE)
+                wb.close()
+
+                saved += 1
+                print(f"Saved [{saved}/{count_needed}]: {name} | phone:{phone} | addr_present:{bool(address_text)} | loc:{google_maps_loc}")
+                if debug_path:
+                    print(f" -> saved debug screenshot: {debug_path}")
+
+                # move pointer to next card in visual order
+                card_index += 1
+
+                # if saved reached required, break
+                if saved >= count_needed:
                     break
-            except Exception:
-                print("Couldn't navigate to next page or load more results.")
-                break
+
+            except Exception as e:
+                # on any error with this card, log and move to next card
+                print("Error while processing shop at index", card_index, ":", e)
+                try:
+                    page.keyboard.press("Escape")
+                except:
+                    pass
+                card_index += 1
+                continue
 
         browser.close()
 
