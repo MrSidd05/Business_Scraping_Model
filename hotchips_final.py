@@ -6,6 +6,7 @@ import time
 from datetime import datetime
 from urllib.parse import quote_plus
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font
 from playwright.sync_api import sync_playwright
 
 # ----------------------------
@@ -17,6 +18,9 @@ DEBUG_DIR = "debug_failures"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(DUP_DIR, exist_ok=True)
 os.makedirs(DEBUG_DIR, exist_ok=True)
+
+# standard link font for excel
+LINK_FONT = Font(color="0000FF", underline="single")
 
 # ----------------------------
 # Helpers
@@ -46,7 +50,7 @@ def extract_coords_from_url(url):
     return None
 
 # ----------------------------
-# Excel / duplicate helpers (unchanged behaviour)
+# Excel / duplicate helpers (unchanged behaviour except hyperlinking)
 # ----------------------------
 def base_dup_path():
     return os.path.join(DUP_DIR, "duplicated.xlsx")
@@ -89,6 +93,10 @@ def read_entries_from_dup(path):
     return entries
 
 def save_timestamped_dup(rows):
+    """
+    rows: iterable of rows [[date, shop_name, phone, area_location, google_maps_of_the_area], ...]
+    this function now makes the last column a clickable hyperlink when possible
+    """
     timestamp = now_ts()
     path = os.path.join(DUP_DIR, f"duplicated_{timestamp}.xlsx")
     wb = Workbook()
@@ -96,6 +104,17 @@ def save_timestamped_dup(rows):
     ws.append(["date", "shop_name", "phone_number", "area_location", "google_maps_of_the_area"])
     for r in rows:
         ws.append(r)
+        # turn last appended cell into hyperlink if it looks like a URL
+        try:
+            row_idx = ws.max_row
+            url_val = (r[4] or "").strip()
+            if url_val and url_val.upper() != "NA" and url_val.lower().startswith("http"):
+                cell = ws.cell(row=row_idx, column=5)
+                cell.value = url_val
+                cell.hyperlink = url_val
+                cell.font = LINK_FONT
+        except Exception:
+            pass
     wb.save(path)
     wb.close()
     return path
@@ -117,6 +136,17 @@ def append_to_and_update_timestamp(existing_path, new_rows):
     appended_count = 0
     for fr in filtered_rows:
         ws_existing.append(fr)
+        # hyperlink last column if URL
+        try:
+            row_idx = ws_existing.max_row
+            url_val = (fr[4] or "").strip()
+            if url_val and url_val.upper() != "NA" and url_val.lower().startswith("http"):
+                cell = ws_existing.cell(row=row_idx, column=5)
+                cell.value = url_val
+                cell.hyperlink = url_val
+                cell.font = LINK_FONT
+        except Exception:
+            pass
         appended_count += 1
     new_path = os.path.join(DUP_DIR, f"duplicated_{now_ts()}.xlsx")
     wb_existing.save(new_path)
@@ -550,7 +580,7 @@ def scrape_hot_chips(area, count_needed):
                             dup_seen.add(dup_row)
                             print(f"[DUP-RECORDED] {name}")
 
-                    # Save to main file
+                    # Save to main file (append then set hyperlink on last column if URL)
                     try:
                         wb = load_workbook(MAIN_FILE)
                         ws = wb.active
@@ -560,6 +590,18 @@ def scrape_hot_chips(area, count_needed):
                         ws.append(["date", "shop_name", "phone_number", "area_location", "google_maps_of_the_area"])
 
                     ws.append([today, name, phone, address_text, google_maps_loc])
+                    # set hyperlink if google_maps_loc looks like a URL
+                    try:
+                        r_idx = ws.max_row
+                        url_val = (google_maps_loc or "").strip()
+                        if url_val and url_val.upper() != "NA" and url_val.lower().startswith("http"):
+                            cell = ws.cell(row=r_idx, column=5)
+                            cell.value = url_val
+                            cell.hyperlink = url_val
+                            cell.font = LINK_FONT
+                    except Exception:
+                        pass
+
                     wb.save(MAIN_FILE)
                     wb.close()
 
@@ -621,7 +663,7 @@ def scrape_hot_chips(area, count_needed):
 
         browser.close()
 
-    # duplicate: append/update behavior unchanged
+    # duplicate: append/update behavior unchanged except hyperlinking
     latest_ts_dup = find_latest_timestamped_dup()
     base_exists = os.path.exists(BASE_DUP)
     if not dup_entries:
